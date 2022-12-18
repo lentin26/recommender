@@ -17,19 +17,25 @@ def encode_data(data):
 
 class BayesMatchBase:
 
-    def __init__(self, u_data, v_data, n_common, n_clusters):
+    def __init__(self, u_data, v_data, n_common, n_clusters, u_data_test=None, v_data_test=None):
 
-        u_data = encode_data(u_data)
-        v_data = encode_data(v_data)
+        # u_data = encode_data(u_data)
+        # v_data = encode_data(v_data)
 
         # convert to numpy
         if isinstance(u_data, pd.DataFrame):
             u_data = u_data.to_numpy()
         if isinstance(v_data, pd.DataFrame):
             v_data = v_data.to_numpy()
+        if isinstance(u_data_test, pd.DataFrame):
+            u_data_test = u_data_test.to_numpy()
+        if isinstance(v_data_test, pd.DataFrame):
+            v_data_test = v_data_test.to_numpy()
 
         self.u_data = u_data
         self.v_data = v_data
+        self.u_data_test = u_data_test
+        self.v_data_test = v_data_test
 
         # compute observed ontology sizes for user, item and common view features.
         # features are indicated by position, vocabulary/ontology size by value
@@ -51,10 +57,10 @@ class BayesMatchBase:
         self.n_clusters = n_clusters
         self.n_common = n_common
 
-        # user cluster count
-        self.ucc = zeros((n_users, n_clusters))
-        # item cluster count
-        self.icc = zeros((n_items, n_clusters))
+        self.ucc = zeros((n_users, n_clusters))     # cluster assignment
+        self.uc = zeros((n_users, n_clusters))      # cluster count
+        self.icc = zeros((n_items, n_clusters))     # cluster assignment
+        self.ic = zeros((n_items, n_clusters))      # cluster count
 
         # user cluster assignment
         self.ufa = zeros(n_users)
@@ -62,9 +68,11 @@ class BayesMatchBase:
         self.ifa = zeros(n_items)
 
         # user, cluster, user-specific vocab tensor for each feature
-        self.ucf = [zeros((n_users, n_clusters, v_users[i])) for i in range(u_data.shape[1])]
+        self.ucf = [zeros((n_users, n_clusters, v_users[i])) for i in range(u_data.shape[1])]   # vocab assignment
+        self.ucu = [zeros((n_users, n_clusters, v_users[i])) for i in range(u_data.shape[1])]   # vocab count
         # item, cluster, item-specific vocab for each feature
-        self.icf = [zeros((n_items, n_clusters, v_items[i])) for i in range(v_data.shape[1])]
+        self.icf = [zeros((n_items, n_clusters, v_items[i])) for i in range(v_data.shape[1])]   # vocab assignment
+        self.icu = [zeros((n_items, n_clusters, v_items[i])) for i in range(v_data.shape[1])]   # vocab assignment
 
         # dirichlet smoothing parameters
         self.alpha = 100
@@ -73,7 +81,7 @@ class BayesMatchBase:
         # parameters to learn
         # self.theta_u = zeros(n_clusters)
         # self.theta_v = zeros(n_clusters)
-        # self.phi_u = [zeros((n_clusters, v_users[i])) for i in range(len(v_users))]
+        self.phi_u = [zeros((n_clusters, v_users[i])) for i in range(len(v_users))]
         # self.phi_v = [zeros((n_clusters, v_items[i])) for i in range(len(v_items))]
         # self.phi_c = [zeros((n_clusters, v_common[i])) for i in range(len(v_common))]
 
@@ -100,29 +108,37 @@ class BayesMatchBase:
         """
         # select a view
         if view == 0:
-            cf, cc = self.ucf, self.ucc
+            cf, cc, phi = self.ucf, self.ucc, self.phi_u
         elif view == 1:
             cf, cc = self.icf, self.icc
         else:
             raise Exception("Selected view must either be 0 or 1.")
 
         # decrement cluster-user feature count
-        if i == -1:
-            for j, x in enumerate(v):
-                # v += len(c)
-                cf[j][uid, k, x] += i
-            # decrement cluster-common feature count
-            for j, x in enumerate(c):
-                cf[j][uid, k, x] += i
-        if i == 1:
-            for j, x in enumerate(v):
-                # v += len(c)
-                cf[j][:, k, x] += i
-                # decrement cluster-common feature count
-            for j, x in enumerate(c):
-                cf[j][:, k, x] += i
+        for j, x in enumerate(v):
+            # v += len(c)
+            cf[j][uid, k, x] += i
+        # decrement cluster-common feature count
+        for j, x in enumerate(c):
+            cf[j][uid, k, x] += i
         # increment/decrement user cluster count
         cc[uid, k] += i
+
+    def update_counts(self, uid, k, v, c, view, iteration, burn_in):
+        # select a view
+        if view == 0:
+            cf, cc = self.ucu, self.uc
+        elif view == 1:
+            cf, cc = self.icu, self.ic
+        else:
+            raise Exception("Selected view must either be 0 or 1.")
+
+        if iteration >= burn_in:
+            cc[uid, k] += 1
+            for j, x in enumerate(v):
+                cf[j][uid, k, x] += 1
+            for j, x in enumerate(c):
+                cf[j][uid, k, x] += 1
 
     def get_conditional_prob(self, uid, v, c, view):
 
@@ -141,7 +157,10 @@ class BayesMatchBase:
         # get user-feature counts
         user_prod = 1
         for i, x in enumerate(v):
-            user_prod *= cf[i][:, :, x].sum(axis=0) + beta
+            if isinstance(x, list):
+                user_prod *= cf[i][:, :, x].sum(axis=0).sum(axis=1) + beta
+            else:
+                user_prod *= cf[i][:, :, x].sum(axis=0) + beta
             user_prod /= cf[i][:, :, :].sum(axis=0).sum(axis=1) + vocab_sizes[i] * beta
 
         # get common-feature counts
@@ -155,21 +174,34 @@ class BayesMatchBase:
         return cond_prob / sum(cond_prob)
 
     def _loglikelihood(self):
+        """
+        Measures loglikelihood on test data if available, otherwise captures loglikelihood on
+        the train set.
+        :return:
+        """
         beta = self.beta
         ll = 0
         n = 0
-        for view, data in enumerate([self.u_data, self.v_data]):
+        # use test data if it's available
+        if self.u_data_test is not None and self.v_data_test is not None:
+            test_data = [self.u_data_test, self.v_data_test]
+        else:
+            test_data = [self.u_data, self.v_data]
+        for view, data in enumerate(test_data):
             if view == 0:
-                cc, cf, vocab_sizes = self.ucc, self.ucf, self.v_users
+                cc, cf, vocab_sizes = self.uc, self.ucu, self.v_users
             elif view == 1:
-                cc, cf, vocab_sizes = self.icc, self.icf, self.v_items
+                cc, cf, vocab_sizes = self.ic, self.icu, self.v_items
             else:
                 raise Exception("Selected view must either be 0 or 1.")
             for uid, fv in enumerate(data):
                 cs, vs = fv[:n], fv[n:]
                 for x, v in enumerate(vs):
                     # number of feature = v assignments
-                    ll += log(sum(cf[x][:, :, v].sum(axis=0) + beta))
+                    if isinstance(v, list):
+                        ll += log(sum(cf[x][:, :, v].sum(axis=0).sum(axis=1) + beta))
+                    else:
+                        ll += log(sum(cf[x][:, :, v].sum(axis=0) + beta))
                     # number of feature assignments
                     ll -= log(sum(cf[x][:, :, :].sum(axis=0).sum(axis=1) + vocab_sizes[x] * beta))
                 for x, v in enumerate(cs):
@@ -191,6 +223,18 @@ class BayesMatchBase:
         perplexity = 2 ** (-log_likelihood / n)
         self.log_likelihood_trace.append(log_likelihood)
         self.perplexity_trace.append(perplexity)
+
+    def get_theta(self, view):
+        # select a view
+        if view == 0:
+            cf, cc = self.ucu, self.uc
+        elif view == 1:
+            cf, cc = self.icu, self.ic
+        else:
+            raise Exception("Selected view must either be 0 or 1.")
+
+        return cc/cc.sum(axis=1).reshape(-1, 1)
+
 
 
 

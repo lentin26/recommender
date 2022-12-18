@@ -6,22 +6,35 @@ import pandas as pd
 
 class BayesMatch(BayesMatchBase):
 
-    def __init__(self, u_data, v_data, n_common, burn_in, n_samples, eval_every, n_clusters, *args, **kwargs):
+    def __init__(self,
+                 u_data,
+                 v_data,
+                 n_common,
+                 burn_in,
+                 n_samples,
+                 n_clusters,
+                 u_data_test=None,
+                 v_data_test=None):
         """
 
         :param n_common: number of common features
         :param u_data: users data with first n_common columns corresponding to common features
         :param v_data: item data with first n_common columns corresponding to common features
-        :param args:
-        :param kwargs:
         """
-        super().__init__(u_data, v_data, n_common, n_clusters)
+        super().__init__(u_data, v_data, n_common, n_clusters, u_data_test=None, v_data_test=None)
 
         # convert to numpy
         if isinstance(u_data, pd.DataFrame):
             u_data = u_data.to_numpy()
         if isinstance(v_data, pd.DataFrame):
             v_data = v_data.to_numpy()
+        if isinstance(u_data_test, pd.DataFrame):
+            u_data_test = u_data_test.to_numpy()
+        if isinstance(v_data_test, pd.DataFrame):
+            v_data_test = v_data_test.to_numpy()
+
+        self.u_data_test = u_data_test
+        self.v_data_test = v_data_test
 
         self.u_data = u_data
         self.v_data = v_data
@@ -30,7 +43,6 @@ class BayesMatch(BayesMatchBase):
 
         self.burn_in = burn_in
         self.n_samples = n_samples
-        self.eval_every = eval_every
         self.iteration = 0
 
     def random_init(self):
@@ -56,7 +68,7 @@ class BayesMatch(BayesMatchBase):
                 k = int(ca[uid])
                 self.update(uid, k, v=v, c=c, view=view, i=1)
 
-    def _sample(self, view):
+    def _sample(self, view, iteration):
         """
         Samples new cluster assignments for features in all members and updates the current state of the posterior
         """
@@ -89,6 +101,7 @@ class BayesMatch(BayesMatchBase):
             k_new = multinomial(1, probs).rvs().argmax()
             # increment all corpus statistics by on
             self.update(uid, k_new, v, c, view, i=1)
+            self.update_counts(uid, k_new, v, c, view, iteration, self.burn_in)
             fa[uid] = k_new
 
             # update parameter traces
@@ -108,8 +121,8 @@ class BayesMatch(BayesMatchBase):
         self.random_init()
         for iteration in range(self.burn_in + self.n_samples):
             # 1) generate user and item samples from the chain
-            self._sample(view=0)  # sample user
-            self._sample(view=1)  # sample item
+            self._sample(view=0, iteration=iteration)  # sample user
+            self._sample(view=1, iteration=iteration)  # sample item
 
             # trace metrics to ensure convergence
             self.trace_metrics()
@@ -130,26 +143,40 @@ class BayesMatch(BayesMatchBase):
 
 if __name__ == "__main__":
     import pandas as pd
+    from ast import literal_eval
 
-    # book recommender
-    user = pd.read_csv('data/books/users_enc.csv')
-    item = pd.read_csv('data/books/books_enc.csv')
+    user_cols = ['user_id', 'gender_enc', 'decades_lived_enc', 'occupation_enc']
+    item_cols = ['item_id', 'genre_enc', 'release_decade_enc']
+
+    user = pd.read_csv('data/ml-100k/users_enc.csv', usecols=user_cols)
+    item = pd.read_csv('data/ml-100k/items_enc.csv', usecols=item_cols)
+
+    item['genre_enc'] = item['genre_enc'].apply(lambda x: literal_eval(x))
+
+    from sklearn.model_selection import train_test_split
+    u_train, u_test = train_test_split(
+        user, test_size=0.20, random_state=42)
+
+    v_train, v_test = train_test_split(
+        item, test_size=0.20, random_state=42)
 
     # instantiate BayesMatch
     m = 1000
-    n_clusters = 2
+    n_clusters = 3
     match = BayesMatch(
-        u_data=user.drop('user_id', axis=1).head(m),
-        v_data=item.drop('item_id', axis=1).head(m),
+        u_data=u_train.drop('user_id', axis=1),
+        v_data=v_train.drop('item_id', axis=1),
         n_common=0,
         n_clusters=n_clusters,
         burn_in=0,
         n_samples=10,
-        eval_every=100
+        u_data_test=u_test.drop('user_id', axis=1),
+        v_data_test=v_test.drop('item_id', axis=1)
     )
 
     # fit data
     match.fit()
+    match.get_theta(view=0)
 
     import matplotlib.pyplot as plt
     # plot results
